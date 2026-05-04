@@ -1,0 +1,4 @@
+opensearch-py==2.6.0
+sentence-transformers==3.0.1
+numpy==1.26.4
+cocoindex==0.3.6
