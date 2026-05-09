@@ -21,7 +21,7 @@ def ensure_index(dim=384):
                 "source_path": {"type": "keyword"},
                 "source_name": {"type": "keyword"},
                 "content": {"type": "text"},
-                "embedding": {"type": "knn_vector", "dimension": dim, "method": {"name": "hnsw", "space_type": "cosinesimil", "engine": "nmslib"}},
+                "embedding": {"type": "knn_vector", "dimension": dim, "method": {"name": "hnsw", "space_type": "cosinesimil", "engine": "lucene"}},
                 "section": {"type": "keyword"},
                 "chunk_index": {"type": "integer"},
                 "content_hash": {"type": "keyword"},

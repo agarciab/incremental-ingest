@@ -1,63 +1,174 @@
-"""POC pipeline: tries CocoIndex import (for viability) and uses custom OpenSearch exporter."""
-import hashlib, json, os
+"""
+CocoIndex + OpenSearch integration POC.
+
+CocoIndex gestiona:
+  - Detecció incremental de canvis de fitxers via @coco.fn(memo=True)
+  - Escanejat de fitxers via localfs.walk_dir
+  - Chunking via RecursiveSplitter
+  - Embeddings via SentenceTransformerEmbedder
+  - State DB intern (COCOINDEX_DB_PATH) — substitueix state.json
+
+Export OpenSearch personalitzat:
+  - CocoIndex no té connector natiu per a OpenSearch
+  - Els chunks s'escriuen directament a OpenSearch dins de @coco.fn(memo=True)
+  - Les eliminacions es gestionen amb un pas de cleanup posterior
+"""
+import hashlib
+import os
+import pathlib
 from datetime import datetime, timezone
-from pathlib import Path
-from embeddings import embed_texts, MODEL_NAME
-from opensearch_client import client, INDEX
+from typing import AsyncIterator
 
-try:
-    import cocoindex  # noqa: F401
-    COCOINDEX_AVAILABLE = True
-except Exception:
-    COCOINDEX_AVAILABLE = False
+import cocoindex as coco
+from cocoindex.connectors import localfs
+from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
+from cocoindex.ops.text import RecursiveSplitter
+from cocoindex.resources.file import FileLike, PatternFilePathMatcher
+from opensearchpy.helpers import bulk
 
+from opensearch_client import INDEX, client
 
-def sha(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+DATA_DIR = os.getenv("DATA_DIR", "/data/documents")
+PIPELINE_VERSION = os.getenv("PIPELINE_VERSION", "poc-v1")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-def split_chunks(text, size=420):
-    parts, i = [], 0
-    while i < len(text):
-        parts.append(text[i:i+size])
-        i += size
-    return parts
+_splitter = RecursiveSplitter()
 
 
-def run_pipeline(data_dir, state_dir, pipeline_version="poc-v1"):
+@coco.lifespan
+async def _lifespan(builder: coco.EnvironmentBuilder) -> AsyncIterator[None]:
+    builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
+    yield
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+@coco.fn(memo=True)
+async def _process_file(file: FileLike) -> None:
+    """Chunketja, embeds i fa upsert d'un fitxer a OpenSearch.
+
+    Saltat automàticament per CocoIndex si el contingut del fitxer no ha canviat.
+    """
+    text = await file.read_text()
+    doc_id = file.file_path.path.stem
+    doc_hash = _sha(text)
     now = datetime.now(timezone.utc).isoformat()
-    state_path = Path(state_dir) / "state.json"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    old = json.loads(state_path.read_text()) if state_path.exists() else {}
-    new = {}
-    c = client()
 
-    for f in sorted(Path(data_dir).glob("*")):
-        if not f.is_file():
-            continue
-        txt = f.read_text(encoding="utf-8", errors="ignore")
-        doc_id = f.stem
-        doc_hash = sha(txt)
-        new[doc_id] = {"path": str(f), "document_hash": doc_hash}
-        if old.get(doc_id, {}).get("document_hash") == doc_hash:
-            continue
-        chunks = split_chunks(txt)
-        vecs = embed_texts(chunks)
-        c.delete_by_query(index=INDEX, body={"query": {"bool": {"must": [{"term": {"document_id": doc_id}}, {"term": {"status": "active"}}]}}}, conflicts="proceed", refresh=True)
-        for i, (ch, vec) in enumerate(zip(chunks, vecs)):
-            cid = f"{doc_id}::{i}::{sha(ch)[:10]}"
-            body = {
-                "chunk_id": cid, "document_id": doc_id, "source_path": str(f), "source_name": f.name,
-                "content": ch, "embedding": vec, "section": "root", "chunk_index": i,
-                "content_hash": sha(ch), "document_hash": doc_hash, "status": "active",
-                "ingested_at": now, "updated_at": now, "parser": "markdown-text", "embedding_model": MODEL_NAME,
-                "pipeline_version": pipeline_version,
-            }
-            c.index(index=INDEX, id=cid, body=body, refresh=True)
+    chunks = _splitter.split(text, chunk_size=420, chunk_overlap=0)
+    embedder = coco.use_context(EMBEDDER)
 
-    removed = set(old.keys()) - set(new.keys())
-    for doc_id in removed:
-        c.update_by_query(index=INDEX, body={"query": {"term": {"document_id": doc_id}}, "script": {"source": "ctx._source.status='deleted'; ctx._source.updated_at=params.ts", "params": {"ts": now}}}, conflicts="proceed", refresh=True)
+    os_client = client()
+    os_client.delete_by_query(
+        index=INDEX,
+        body={"query": {"bool": {"must": [
+            {"term": {"document_id": doc_id}},
+            {"term": {"status": "active"}},
+        ]}}},
+        conflicts="proceed",
+        refresh=True,
+    )
 
-    state_path.write_text(json.dumps(new, indent=2))
-    return {"cocoindex_available": COCOINDEX_AVAILABLE, "processed": len(new), "removed": list(removed)}
+    actions = []
+    for i, chunk in enumerate(chunks):
+        embedding = await embedder.embed(chunk.text)
+        cid = f"{doc_id}::{i}::{_sha(chunk.text)[:10]}"
+        actions.append({
+            "_index": INDEX,
+            "_id": cid,
+            "_source": {
+                "chunk_id": cid,
+                "document_id": doc_id,
+                "source_path": str(pathlib.Path(DATA_DIR) / file.file_path.path),
+                "source_name": file.file_path.path.name,
+                "content": chunk.text,
+                "embedding": embedding.tolist(),
+                "section": "root",
+                "chunk_index": i,
+                "content_hash": _sha(chunk.text),
+                "document_hash": doc_hash,
+                "status": "active",
+                "ingested_at": now,
+                "updated_at": now,
+                "parser": "markdown-text",
+                "embedding_model": EMBED_MODEL,
+                "pipeline_version": PIPELINE_VERSION,
+            },
+        })
+
+    if actions:
+        bulk(os_client, actions)
+    os_client.indices.refresh(index=INDEX)
+
+
+@coco.fn
+async def _app_main(sourcedir: pathlib.Path) -> None:
+    files = localfs.walk_dir(
+        sourcedir,
+        recursive=False,
+        path_matcher=PatternFilePathMatcher(included_patterns=["**/*.md", "**/*.txt"]),
+    )
+    await coco.mount_each(_process_file, files.items())
+
+
+_app = coco.App(
+    coco.AppConfig(name="KnowledgeChunksFlow"),
+    _app_main,
+    sourcedir=pathlib.Path(DATA_DIR),
+)
+
+
+def _mark_deleted(data_dir: str) -> list[str]:
+    """Soft-delete a OpenSearch els chunks de fitxers que ja no existeixen al disc."""
+    os_client = client()
+    now = datetime.now(timezone.utc).isoformat()
+
+    resp = os_client.search(
+        index=INDEX,
+        body={
+            "size": 0,
+            "query": {"term": {"status": "active"}},
+            "aggs": {"doc_ids": {"terms": {"field": "document_id", "size": 10_000}}},
+        },
+    )
+
+    existing = {p.stem for p in pathlib.Path(data_dir).glob("*") if p.is_file()}
+    removed = []
+    for bucket in resp.get("aggregations", {}).get("doc_ids", {}).get("buckets", []):
+        doc_id = bucket["key"]
+        if doc_id not in existing:
+            os_client.update_by_query(
+                index=INDEX,
+                body={
+                    "query": {"bool": {"must": [
+                        {"term": {"document_id": doc_id}},
+                        {"term": {"status": "active"}},
+                    ]}},
+                    "script": {
+                        "source": "ctx._source.status='deleted'; ctx._source.updated_at=params.ts",
+                        "params": {"ts": now},
+                    },
+                },
+                conflicts="proceed",
+                refresh=True,
+            )
+            removed.append(doc_id)
+    return removed
+
+
+def run_pipeline(data_dir: str, state_dir: str, pipeline_version: str = "poc-v1") -> dict:
+    """Executa la ingesta incremental.
+
+    CocoIndex re-processa només els fitxers que han canviat (memo=True).
+    Els fitxers eliminats del disc es marquen com 'deleted' a OpenSearch.
+    """
+    _app.update_blocking(report_to_stdout=True)
+    removed = _mark_deleted(data_dir)
+    return {
+        "cocoindex_available": True,
+        "pipeline": "cocoindex",
+        "removed": removed,
+    }
